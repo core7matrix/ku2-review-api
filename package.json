@@ -1,0 +1,17 @@
+{
+  "name": "shopify-review-average-webhook",
+  "version": "1.0.0",
+  "description": "Shopify webhook handler that calculates average review ratings from third-party review app metafields and stores the result as a product metafield.",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js",
+    "dev": "node --watch app.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "dotenv": "^16.4.5"
+  }
+}
