@@ -5,6 +5,9 @@ const { URLSearchParams } = require("node:url");
 
 const app = express();
 
+const FETCH_TIMEOUT_MS = 15_000;
+const IS_VERCEL = !!process.env.VERCEL;
+
 /** Strip protocol, path, and trailing slash so URLs are always valid. */
 function normalizeShopDomain(input) {
   if (!input) return "";
@@ -103,9 +106,12 @@ async function getToken() {
 
   console.log("[AUTH] Requesting new access token via client_credentials…");
 
-  const response = await fetch(
-    `https://${CONFIG.shopifyStoreUrl}/admin/oauth/access_token`,
-    {
+  const tokenUrl = `https://${CONFIG.shopifyStoreUrl}/admin/oauth/access_token`;
+  let response;
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    response = await fetch(tokenUrl, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
@@ -113,8 +119,18 @@ async function getToken() {
         client_id: CONFIG.clientId,
         client_secret: CONFIG.clientSecret,
       }),
-    }
-  );
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+  } catch (err) {
+    const c = err.cause;
+    const extra = c
+      ? ` ${c.code ? `[${c.code}] ` : ""}${c.message || c}`
+      : "";
+    throw new Error(
+      `[AUTH] Network error requesting token from ${CONFIG.shopifyStoreUrl}: ${err.message || err}.${extra}`
+    );
+  }
 
   if (!response.ok) {
     const text = await response.text();
@@ -139,6 +155,7 @@ const REFRESH_INTERVAL_MS = 23 * 60 * 60 * 1000; // 23 hours
 let refreshTimer = null;
 
 function startTokenRefreshTimer() {
+  if (IS_VERCEL) return; // Timers are useless in serverless; skip.
   if (refreshTimer) clearInterval(refreshTimer);
 
   refreshTimer = setInterval(async () => {
@@ -150,7 +167,6 @@ function startTokenRefreshTimer() {
     }
   }, REFRESH_INTERVAL_MS);
 
-  // Don't let the timer keep the process alive if everything else shuts down.
   refreshTimer.unref();
 }
 
@@ -215,6 +231,8 @@ async function shopifyGraphQL(query, variables = {}) {
   const accessToken = await getToken();
   let res;
   try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
     res = await fetch(url, {
       method: "POST",
       headers: {
@@ -222,7 +240,9 @@ async function shopifyGraphQL(query, variables = {}) {
         "X-Shopify-Access-Token": accessToken,
       },
       body: JSON.stringify({ query, variables }),
+      signal: controller.signal,
     });
+    clearTimeout(timeout);
   } catch (err) {
     const c = err.cause;
     const extra = c
@@ -260,13 +280,22 @@ async function shopifyGraphQLWithRetry(query, variables = {}, maxRetries = 3) {
     try {
       return await shopifyGraphQL(query, variables);
     } catch (err) {
+      const msg = err.message || "";
       const isRetryable =
-        err.message.includes("429") ||
-        err.message.includes("Throttled") ||
-        err.message.includes("401");
+        msg.includes("429") ||
+        msg.includes("Throttled") ||
+        msg.includes("401") ||
+        msg.includes("fetch failed") ||
+        msg.includes("Network error") ||
+        msg.includes("ECONNRESET") ||
+        msg.includes("ETIMEDOUT") ||
+        msg.includes("ENOTFOUND") ||
+        msg.includes("abort");
       if (isRetryable && attempt < maxRetries) {
         const backoff = attempt * 2000;
-        console.warn(`[RETRY] Attempt ${attempt}/${maxRetries}, retrying in ${backoff}ms…`);
+        console.warn(
+          `[RETRY] Attempt ${attempt}/${maxRetries} failed: ${msg}. Retrying in ${backoff}ms…`
+        );
         await new Promise((r) => setTimeout(r, backoff));
         continue;
       }
@@ -417,15 +446,15 @@ function calculateAverageReview(reviewsJson) {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 app.post("/webhooks/products/update", verifyShopifyWebhook, async (req, res) => {
-  res.status(200).send("OK");
-
+  // In serverless (Vercel), the function is frozen once the response is sent.
+  // ALL processing must complete BEFORE we call res.send().
   try {
     const payload = req.body;
     const productGid = resolveProductGid(payload, req.rawBody);
 
     if (!productGid) {
       console.error("[WEBHOOK] Could not resolve product GID from payload");
-      return;
+      return res.status(200).send("OK");
     }
 
     console.log(`[WEBHOOK] Product updated: ${productGid} ("${payload.title || "unknown"}")`);
@@ -435,7 +464,7 @@ app.post("/webhooks/products/update", verifyShopifyWebhook, async (req, res) => 
 
     if (!data?.product) {
       console.error(`[WEBHOOK] Product not found: ${productGid}`);
-      return;
+      return res.status(200).send("OK");
     }
 
     const metafields = data.product.metafields.edges.map((e) => e.node);
@@ -451,7 +480,7 @@ app.post("/webhooks/products/update", verifyShopifyWebhook, async (req, res) => 
       console.log(
         `[WEBHOOK] No review metafield found (${CONFIG.reviewMetafieldNamespace}.${CONFIG.reviewMetafieldKey}) – nothing to do`
       );
-      return;
+      return res.status(200).send("OK");
     }
 
     // ── Step 3: Calculate the average ──────────────────────
@@ -459,7 +488,7 @@ app.post("/webhooks/products/update", verifyShopifyWebhook, async (req, res) => 
 
     if (averageRating === null) {
       console.log("[WEBHOOK] Could not compute average – skipping update");
-      return;
+      return res.status(200).send("OK");
     }
 
     // ── Step 4: Write the "Average Review" metafield ───────
@@ -478,14 +507,16 @@ app.post("/webhooks/products/update", verifyShopifyWebhook, async (req, res) => 
     const errors = mutationResult?.metafieldsSet?.userErrors;
     if (errors && errors.length > 0) {
       console.error("[WEBHOOK] Metafield update errors:", JSON.stringify(errors));
-      return;
+      return res.status(200).send("OK");
     }
 
     console.log(
       `[WEBHOOK] ✔ Updated "${CONFIG.avgReviewMetafieldNamespace}.${CONFIG.avgReviewMetafieldKey}" → ${averageRating} for ${data.product.title}`
     );
+    return res.status(200).send("OK");
   } catch (err) {
     console.error("[WEBHOOK] Unhandled error:", err.stack || err.message || err);
+    return res.status(200).send("OK");
   }
 });
 
@@ -505,27 +536,29 @@ app.get("/", (_req, res) => {
 });
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-//  START SERVER
+//  START SERVER (local only) / EXPORT FOR VERCEL
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-app.listen(PORT, async () => {
-  console.log(`Review average webhook server listening on port ${PORT}`);
-  console.log(`Endpoint: POST /webhooks/products/update`);
-  console.log(`Shopify store: ${CONFIG.shopifyStoreUrl}`);
-  console.log(`GraphQL API: https://${CONFIG.shopifyStoreUrl}/admin/api/${CONFIG.apiVersion}/graphql.json`);
-  console.log(`Review source: ${CONFIG.reviewMetafieldNamespace}.${CONFIG.reviewMetafieldKey}`);
-  console.log(`Average target: ${CONFIG.avgReviewMetafieldNamespace}.${CONFIG.avgReviewMetafieldKey}`);
+if (!IS_VERCEL) {
+  app.listen(PORT, async () => {
+    console.log(`Review average webhook server listening on port ${PORT}`);
+    console.log(`Endpoint: POST /webhooks/products/update`);
+    console.log(`Shopify store: ${CONFIG.shopifyStoreUrl}`);
+    console.log(`GraphQL API: https://${CONFIG.shopifyStoreUrl}/admin/api/${CONFIG.apiVersion}/graphql.json`);
+    console.log(`Review source: ${CONFIG.reviewMetafieldNamespace}.${CONFIG.reviewMetafieldKey}`);
+    console.log(`Average target: ${CONFIG.avgReviewMetafieldNamespace}.${CONFIG.avgReviewMetafieldKey}`);
 
-  // Acquire a token eagerly so we're ready before the first webhook arrives.
-  try {
-    await getToken();
-    console.log("[AUTH] Initial token ready");
-  } catch (err) {
-    console.error("[AUTH] Failed to acquire initial token:", err.message || err);
-    console.error("[AUTH] The server will retry when the first webhook arrives.");
-  }
+    try {
+      await getToken();
+      console.log("[AUTH] Initial token ready");
+    } catch (err) {
+      console.error("[AUTH] Failed to acquire initial token:", err.message || err);
+      console.error("[AUTH] The server will retry when the first webhook arrives.");
+    }
 
-  // Start background timer — refreshes every 23 h (well before 24 h expiry).
-  startTokenRefreshTimer();
-  console.log("[AUTH] Background token refresh scheduled every 23 h");
-});
+    startTokenRefreshTimer();
+    console.log("[AUTH] Background token refresh scheduled every 23 h");
+  });
+}
+
+module.exports = app;
